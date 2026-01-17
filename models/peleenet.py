@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple, Dict
 
 
 class _DenseLayer(nn.Module):
-    def __init__(self, in_channels: int, growth_rate: int, bottleneck_width: float):
+    def __init__(self, in_channels, growth_rate, bottleneck_width):
         super(_DenseLayer, self).__init__()
         growth_rate = growth_rate // 2
         inter_channel = int(growth_rate * bottleneck_width / 4) * 4
@@ -18,7 +17,6 @@ class _DenseLayer(nn.Module):
             nn.BatchNorm2d(growth_rate),
             nn.ReLU(inplace=True)
         )
-
         self.branch2 = nn.Sequential(
             nn.Conv2d(in_channels, inter_channel, kernel_size=1, bias=False),
             nn.BatchNorm2d(inter_channel),
@@ -31,27 +29,26 @@ class _DenseLayer(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out1 = self.branch1(x)
-        out2 = self.branch2(x)
-        return torch.cat([x, out1, out2], 1)
+    def forward(self, x):
+        return torch.cat([x, self.branch1(x), self.branch2(x)], 1)
 
 
 class DenseBlock(nn.Module):
-    def __init__(self, num_layers: int, in_channels: int, growth_rate: int, bottleneck_width: float):
+    def __init__(self, num_layers, in_channels, growth_rate, bottleneck_width):
         super(DenseBlock, self).__init__()
-        self.layers = nn.ModuleList()
-        for i in range(num_layers):
-            self.layers.append(_DenseLayer(in_channels + i * growth_rate, growth_rate, bottleneck_width))
+        self.layers = nn.ModuleList([
+            _DenseLayer(in_channels + i * growth_rate, growth_rate, bottleneck_width)
+            for i in range(num_layers)
+        ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         for layer in self.layers:
             x = layer(x)
         return x
 
 
 class StemBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, in_channels, out_channels):
         super(StemBlock, self).__init__()
         self.conv1 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, bias=False),
@@ -73,54 +70,87 @@ class StemBlock(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         x = self.conv1(x)
         b1 = self.branch1(x)
         b2 = self.branch2(x)
-
         if b1.size()[2:] != b2.size()[2:]:
             b2 = F.interpolate(b2, size=b1.size()[2:], mode='bilinear', align_corners=False)
+        return self.conv2(torch.cat([b1, b2], 1))
 
-        out = torch.cat([b1, b2], 1)
-        out = self.conv2(out)
-        return out
+
+class TransitionBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, use_pooling=True):
+        super(TransitionBlock, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.use_pooling = use_pooling
+        if use_pooling:
+            self.pool = nn.AvgPool2d(kernel_size=2, stride=2, ceil_mode=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        if self.use_pooling:
+            x = self.pool(x)
+        return x
 
 
 class PeleeNet(nn.Module):
-    def __init__(self, num_classes: int = 1000, growth_rate: int = 32,
-                 block_config: List[int] = [3, 4, 8, 6],
-                 bottleneck_width: List[float] = [1, 2, 4, 4]):
+    def __init__(self, num_classes=1000, growth_rate=32, block_config=[3, 4, 8, 6], bottleneck_width=[1, 2, 4, 4]):
         super(PeleeNet, self).__init__()
 
-        self.features = nn.Sequential()
-        self.features.add_module('stem', StemBlock(3, 32))
-
+        self.stem = StemBlock(3, 32)
         curr_channels = 32
-        for i, num_layers in enumerate(block_config):
-            self.features.add_module(f'denseblock{i + 1}',
-                                     DenseBlock(num_layers, curr_channels, growth_rate, bottleneck_width[i]))
-            curr_channels += num_layers * growth_rate
 
-            self.features.add_module(f'transition{i + 1}',
-                                     nn.Sequential(
-                                         nn.Conv2d(curr_channels, curr_channels, kernel_size=1, bias=False),
-                                         nn.BatchNorm2d(curr_channels),
-                                         nn.ReLU(inplace=True)
-                                     ))
+        self.stage1_dense = DenseBlock(block_config[0], curr_channels, growth_rate, bottleneck_width[0])
+        curr_channels += block_config[0] * growth_rate
+        self.stage1_trans = TransitionBlock(curr_channels, curr_channels)
 
-            if i != len(block_config) - 1:
-                self.features.add_module(f'transition{i + 1}_pool',
-                                         nn.AvgPool2d(kernel_size=2, stride=2, ceil_mode=True))
+        self.stage2_dense = DenseBlock(block_config[1], curr_channels, growth_rate, bottleneck_width[1])
+        curr_channels += block_config[1] * growth_rate
+        self.stage2_trans = TransitionBlock(curr_channels, curr_channels)
 
-        self.classifier = nn.Linear(curr_channels, num_classes)
+        self.stage3_dense = DenseBlock(block_config[2], curr_channels, growth_rate, bottleneck_width[2])
+        curr_channels += block_config[2] * growth_rate
+        self.stage3_trans = TransitionBlock(curr_channels, curr_channels)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.features(x)
-        out = F.adaptive_avg_pool2d(features, (1, 1))
-        out = torch.flatten(out, 1)
-        out = self.classifier(out)
-        return out
+        self.stage4_dense = DenseBlock(block_config[3], curr_channels, growth_rate, bottleneck_width[3])
+        curr_channels += block_config[3] * growth_rate
+        self.stage4_trans = TransitionBlock(curr_channels, curr_channels,
+                                            use_pooling=False)  # No pooling in last transition
+
+        self.num_classes = num_classes
+
+    def forward(self, x):
+        x = self.stem(x)
+
+        x = self.stage1_dense(x)
+        x = self.stage1_trans(x)
+
+        x = self.stage2_dense(x)
+        f1 = x
+        x = self.stage2_trans(x)
+
+        x = self.stage3_dense(x)
+        f2 = x
+        x = self.stage3_trans(x)
+
+        x = self.stage4_dense(x)
+        x = self.stage4_trans(x)
+        f3 = x
+
+        return [f1, f2, f3]
 
 
-def build_peleenet(num_classes: int = 1000) -> PeleeNet:
-    return PeleeNet(num_classes=num_classes)
+def build_peleenet(num_classes=1000, pretrained_path='pretrain/peleenet.pth'):
+    model = PeleeNet(num_classes=num_classes)
+    if pretrained_path:
+        try:
+            state_dict = torch.load(pretrained_path, map_location='cpu')
+            model.load_state_dict({k.replace('module.', ''): v for k, v in state_dict.items()}, strict=False)
+        except:
+            pass
+    return model

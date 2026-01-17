@@ -58,17 +58,26 @@ def visualize():
     parser = argparse.ArgumentParser(description='Pelee SSD Visual Test')
     parser.add_argument('--weights', default='weights/pelee_ssd_iteration.pth', type=str)
     parser.add_argument('--root', default='VOCdevkit', type=str)
-    parser.add_argument('--thresh', default=0.1, type=float)
-    parser.add_argument('--top_k', default=5, type=int)
+    parser.add_argument('--thresh', default=0.25, type=float)
+    parser.add_argument('--top_k', default=200, type=int)
     args = parser.parse_args()
 
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 
-    backbone = build_peleenet(num_classes=1000)
+    backbone = build_peleenet(num_classes=1000, pretrained_path=None)
     net = PeleeSSD(backbone, voc['num_classes'], voc)
 
-    state_dict = torch.load(args.weights, map_location=device)
-    net.load_state_dict(state_dict)
+    print(f"Loading weights from {args.weights}...")
+    try:
+        checkpoint = torch.load(args.weights, map_location=device)
+        if 'model_state_dict' in checkpoint:
+            net.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            net.load_state_dict(checkpoint)
+    except Exception as e:
+        print(f"Error loading weights: {e}")
+        return
+
     net.to(device).eval()
 
     dataset = VOCDetection(root=args.root, image_sets=[('2007', 'test')], transform=None)
@@ -91,8 +100,14 @@ def visualize():
                 int(box_data[2] * orig_w), int(box_data[3] * orig_h)
             cv2.rectangle(display_img, (gx1, gy1), (gx2, gy2), (0, 0, 255), 2)
 
-    img_prep = cv2.resize(img, (304, 304)).astype(np.float32)
-    img_prep -= np.array((104, 117, 123))
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    img_prep = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_prep = img_prep.astype(np.float32) / 255.0
+    img_prep = (img_prep - mean) / std
+
+    img_prep = cv2.resize(img_prep, (304, 304))
     x = torch.from_numpy(img_prep).permute(2, 0, 1).unsqueeze(0).to(device)
 
     with torch.no_grad():
@@ -102,27 +117,38 @@ def visualize():
     decoded_boxes = decode(loc[0], priors, voc['variance'])
     conf_scores = F.softmax(conf[0], dim=-1).transpose(1, 0)
 
-    all_scores, all_indices = conf_scores[1:].max(dim=0)
-    top_scores, top_idx_in_priors = all_scores.topk(args.top_k)
+    print("Detecting...")
 
-    print(f"Top {args.top_k} confidences: {top_scores.cpu().numpy()}")
+    for class_idx in range(1, voc['num_classes']):
+        c_scores = conf_scores[class_idx]
+        c_mask = c_scores.gt(args.thresh)
+        scores = c_scores[c_mask]
 
-    for i in range(args.top_k):
-        score = top_scores[i].item()
-        prior_idx = top_idx_in_priors[i].item()
-        class_idx = all_indices[prior_idx].item() + 1
+        if scores.size(0) == 0: continue
 
-        box = decoded_boxes[prior_idx].cpu().numpy()
+        l_mask = c_mask.unsqueeze(1).expand_as(decoded_boxes)
+        boxes = decoded_boxes[l_mask].view(-1, 4)
 
-        box[0::2] *= orig_w
-        box[1::2] *= orig_h
-        x1, y1, x2, y2 = box.astype(np.int32)
+        # Apply NMS
+        ids = nms(boxes, scores, 0.45, args.top_k)
 
-        color = (0, 255, 0) if score > args.thresh else (0, 255, 255)
+        for i in range(ids.size(0)):
+            idx = ids[i]
+            score = scores[idx].item()
+            box = boxes[idx].cpu().numpy()
 
-        cv2.rectangle(display_img, (x1, y1), (x2, y2), color, 2)
-        label = f"{VOC_CLASSES[class_idx - 1]} {score:.2f}"
-        cv2.putText(display_img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+            box[0::2] *= orig_w
+            box[1::2] *= orig_h
+            x1, y1, x2, y2 = box.astype(np.int32)
+
+            color = (0, 255, 0) if score > 0.6 else (0, 255, 255)
+
+            cv2.rectangle(display_img, (x1, y1), (x2, y2), color, 2)
+            label = f"{VOC_CLASSES[class_idx - 1]} {score:.2f}"
+
+            t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+            cv2.rectangle(display_img, (x1, y1 - t_size[1] - 4), (x1 + t_size[0], y1), color, -1)
+            cv2.putText(display_img, label, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
 
     cv2.imwrite("visual_check.jpg", display_img)
     print(f"Saved visual_check.jpg. Red=GT, Green/Yellow=Model.")

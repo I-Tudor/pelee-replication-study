@@ -1,12 +1,6 @@
-import os
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.utils.data as data
-import argparse
-import time
-from typing import Tuple, List
-
+import os, torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim, torch.utils.data as data, argparse, \
+    time
+from datetime import timedelta
 from models.peleenet import build_peleenet
 from models.pelee_ssd import PeleeSSD
 from data.config import voc
@@ -15,107 +9,106 @@ from layers.modules.multibox_loss import MultiBoxLoss
 from utils.augmentations import Augmentation
 
 
-def xavier_init(m):
-    if isinstance(m, nn.Conv2d):
-        nn.init.xavier_uniform_(m.weight)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-
-
 def detection_collate(batch):
-    targets = []
-    imgs = []
+    targets, imgs = [], []
     for sample in batch:
         imgs.append(sample[0])
         targets.append(torch.FloatTensor(sample[1]))
     return torch.stack(imgs, 0), targets
 
 
+def kaiming_init(m):
+    if hasattr(m, 'is_backbone'): return
+    if isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None: nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.constant_(m.weight, 1)
+        nn.init.constant_(m.bias, 0)
+
+
 def train():
-    parser = argparse.ArgumentParser(description='Pelee SSD Training')
+    parser = argparse.ArgumentParser()
     parser.add_argument('--batch_size', default=32, type=int)
-    parser.add_argument('--lr', default=4e-3, type=float)
-    parser.add_argument('--dataset_root', default='VOCdevkit', type=str)
+    parser.add_argument('--lr', default=1e-3, type=float)
+    parser.add_argument('--resume', default=None, type=str)
+    parser.add_argument('--dataset_root', default='VOCdevkit')
     args = parser.parse_args()
 
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("==> Hardware Found: Apple Silicon (MPS). Optimizing memory buffers...")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-        torch.backends.cudnn.benchmark = True
-        print("==> Hardware Found: NVIDIA (CUDA). Enabling CuDNN benchmarking...")
-    else:
-        device = torch.device("cpu")
-        print("==> Hardware Found: CPU. Training will be slow.")
+    device = torch.device(
+        'mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
 
-    print("==> Building Pelee SSD...")
-    backbone = build_peleenet(num_classes=1000)
+    backbone = build_peleenet()
     model = PeleeSSD(backbone, voc['num_classes'], voc)
-    model.apply(xavier_init)
-    model.to(device)
-
-    print("==> Loading Dataset...")
-    dataset = VOCDetection(root=args.dataset_root, transform=Augmentation(voc['min_dim']))
-
-    # Auto-optimize Data Loading
-    # num_workers=0 avoids the macOS multiprocessing hang
-    data_loader = data.DataLoader(
-        dataset,
-        args.batch_size,
-        num_workers=4,
-        shuffle=True,
-        collate_fn=detection_collate,
-        pin_memory=False,
-        persistent_workers=True,
-        multiprocessing_context="forkserver"
-    )
+    model.apply(kaiming_init).to(device)
 
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
     criterion = MultiBoxLoss(voc['num_classes'], 0.5, 3, voc['variance'])
-
-    # Cosine Annealing scheduler as per Pelee paper
+    ds_criterion = nn.BCEWithLogitsLoss()
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=voc['max_iter'])
 
-    if not os.path.exists('weights'):
-        os.mkdir('weights')
+    start_iter = 0
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_iter = checkpoint['iteration']
 
-    print(f"==> Setup Complete. Starting Training on {len(dataset)} images...")
+    dataset = VOCDetection(root=args.dataset_root, transform=Augmentation(voc['min_dim']))
+    loader = data.DataLoader(dataset, args.batch_size, num_workers=4, shuffle=True, collate_fn=detection_collate)
+
     model.train()
+    iteration = start_iter
+    total_start_time = time.time()
 
-    iteration = 0
     while iteration < voc['max_iter']:
-        for images, targets in data_loader:
-            if iteration >= voc['max_iter']:
-                break
+        for images, targets in loader:
+            if iteration >= voc['max_iter']: break
 
-            t0 = time.time()
+            if iteration < 500:
+                lr = (args.lr - 1e-6) * (iteration / 500) + 1e-6
+                for pg in optimizer.param_groups: pg['lr'] = lr
 
             images = images.to(device)
             targets = [ann.to(device) for ann in targets]
 
-            # Forward and Backward
             optimizer.zero_grad()
-            out = model(images)
-            loss_l, loss_c = criterion(out, targets)
-            loss = loss_l + loss_c
+            loc, conf, p, ds1, ds2 = model(images)
+            loss_l, loss_c = criterion((loc, conf, p), targets)
+
+            ds_targets = torch.zeros(images.size(0), voc['num_classes'] - 1).to(device)
+            for i, t in enumerate(targets):
+                if t.size(0) > 0:
+                    labels = t[:, -1].long()
+                    ds_targets[i, labels] = 1.0
+
+            loss_ds = ds_criterion(F.adaptive_avg_pool2d(ds1, 1).view(images.size(0), -1)[:, 1:], ds_targets) + \
+                      ds_criterion(F.adaptive_avg_pool2d(ds2, 1).view(images.size(0), -1)[:, 1:], ds_targets)
+
+            loss = loss_l + loss_c + 0.1 * loss_ds
             loss.backward()
             optimizer.step()
-            scheduler.step()
 
-            t1 = time.time()
+            if iteration >= 500: scheduler.step()
 
             if iteration % 10 == 0:
-                print(f'Iter {iteration:5d} || Loss: {loss.item():.4f} || ' +
-                      f'Conf: {loss_c.item():.4f} Loc: {loss_l.item():.4f} || ' +
-                      f'Time: {t1 - t0:.4f}s || LR: {scheduler.get_last_lr()[0]:.6f}')
+                curr_lr = optimizer.param_groups[0]['lr']
+                elapsed = time.time() - total_start_time
+                avg_time = elapsed / (iteration - start_iter + 1)
+                etc = timedelta(seconds=int(avg_time * (voc['max_iter'] - iteration)))
+
+                print(f'Iter {iteration:6d} || Loss: {loss.item():.4f} || '
+                      f'L: {loss_l.item():.4f} C: {loss_c.item():.4f} DS: {loss_ds.item():.4f} || '
+                      f'LR: {curr_lr:.6f} || ETC: {etc}')
 
             if iteration != 0 and iteration % 5000 == 0:
-                print(f'==> Saving Checkpoint at iteration {iteration}')
-                torch.save(model.state_dict(), f'weights/pelee_ssd_{iteration}.pth')
-
+                torch.save({
+                    'iteration': iteration,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict()
+                }, f'weights/pelee_checkpoint_{iteration}.pth')
             iteration += 1
 
-
-if __name__ == "__main__":
-    train()
+if __name__ == "__main__": train()

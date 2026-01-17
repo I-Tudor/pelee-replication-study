@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, List
 
-
 class MultiBoxLoss(nn.Module):
     def __init__(self, num_classes: int, overlap_thresh: float, neg_pos: int, variance: list):
         super(MultiBoxLoss, self).__init__()
@@ -21,10 +20,12 @@ class MultiBoxLoss(nn.Module):
         loc_t = torch.zeros(num, num_priors, 4).to(device)
         conf_t = torch.zeros(num, num_priors).to(device).long()
 
+        priors_dev = priors.to(device)
+
         for idx in range(num):
             truths = targets[idx][:, :-1].to(device)
             labels = targets[idx][:, -1].long().to(device)
-            self._match(self.threshold, truths, priors.to(device), self.variance, labels, loc_t, conf_t, idx)
+            self._match(self.threshold, truths, priors_dev, self.variance, labels, loc_t, conf_t, idx)
 
         pos = conf_t > 0
         num_pos = pos.sum(dim=1, keepdim=True)
@@ -45,16 +46,16 @@ class MultiBoxLoss(nn.Module):
         num_neg = torch.clamp(self.negpos_ratio * num_pos, max=pos.size(1) - 1)
         neg = rank < num_neg.expand_as(rank)
 
-        pos_idx = pos.unsqueeze(2).expand_as(conf_data)
-        neg_idx = neg.unsqueeze(2).expand_as(conf_data)
+        pos_idx_c = pos.unsqueeze(2).expand_as(conf_data)
+        neg_idx_c = neg.unsqueeze(2).expand_as(conf_data)
 
-        conf_p = conf_data[(pos_idx + neg_idx).gt(0)].view(-1, self.num_classes)
+        conf_p = conf_data[(pos_idx_c + neg_idx_c).gt(0)].view(-1, self.num_classes)
         targets_weighted = conf_t[(pos + neg).gt(0)]
         loss_c = F.cross_entropy(conf_p, targets_weighted, reduction='sum')
 
         N = num_pos.data.sum().float()
         if N == 0:
-            return torch.tensor(0.0).to(device), torch.tensor(0.0).to(device)
+            return torch.tensor(0.0, requires_grad=True).to(device), torch.tensor(0.0, requires_grad=True).to(device)
 
         return loss_l / N, loss_c / N
 
